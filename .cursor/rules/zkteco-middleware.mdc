@@ -1,0 +1,215 @@
+---
+description: ZKTeco K40 Pro Attendance Middleware — Dokploy + PHP + MySQL
+globs: **/*.php, **/Dockerfile, **/docker-compose.yml, **/.env*
+alwaysApply: true
+---
+
+# ZKTeco K40 Pro Attendance Middleware
+
+## Project Context
+Standalone PHP middleware that receives attendance pushes from **multiple** ZKTeco biometric devices via the ADMS protocol. Deployed on a company server using Dokploy (Docker/Apache). Exposes a REST API (API-key secured) for other internal projects to consume. No ZKTeco software or license required.
+
+---
+
+## Infrastructure
+
+### Existing Device
+- **Model:** ZKTeco K40 Pro
+- **Serial Number:** GED7241700908
+- **Device IP:** `192.168.100.201`
+- **Device Port:** `4370` (TCP)
+- **MAC Address:** `00:17:61:11:50:87`
+- **Fingerprint Algorithm:** ZKFinger VX10.0
+- **Server Mode on Device:** ADMS
+
+### Company Server
+- **Local IP:** `192.168.100.237`
+- **SSH Access:** `ssh -p 65002 u470420242@89.117.169.210`
+- **SSH User:** `ccladmin`
+- **Middleware Port:** `8012` (confirmed free)
+- **Deployment:** Dokploy
+
+### Device ADMS Configuration
+- **Server Address:** `192.168.100.237`
+- **Server Port:** `8012`
+- **HTTPS:** OFF
+
+### Adding a New Device
+Devices are registered in the `devices` DB table — no code changes needed:
+```
+POST /api/devices
+X-API-Key: <admin key>
+{ "serial_number": "...", "name": "...", "department": "...", "location": "..." }
+```
+
+---
+
+## Architecture
+
+```
+ZKTeco Devices (any number, any location)
+    ↓  HTTP ADMS push  → /adms?action=...&SN=...
+public/index.php  (Front Controller)
+    ├── /adms/*     → src/adms/AdmsHandler.php
+    ├── /api/*      → ApiKeyAuth → Controllers
+    └── /dashboard  → dashboard/index.php
+        ↓
+MySQL (Dokploy managed)
+```
+
+---
+
+## File Structure
+
+```
+pointage/
+├── Dockerfile
+├── docker-compose.yml
+├── .env
+├── public/
+│   ├── index.php           ← front controller
+│   └── .htaccess
+├── src/
+│   ├── bootstrap.php       ← env loader, autoloader, helpers
+│   ├── Database.php        ← singleton PDO wrapper
+│   ├── Router.php          ← lightweight regex path router
+│   ├── adms/
+│   │   └── AdmsHandler.php ← device ADMS protocol handler
+│   └── api/
+│       ├── Middleware/
+│       │   └── ApiKeyAuth.php
+│       ├── Response.php
+│       ├── AttendanceController.php
+│       └── DeviceController.php
+├── migrations/
+│   └── 001_initial.sql
+├── logs/                   ← daily log files YYYY-MM-DD.log
+└── dashboard/
+    └── index.php
+```
+
+---
+
+## Database Schema
+
+### `devices`
+| Column | Type | Notes |
+|---|---|---|
+| id | INT UNSIGNED PK | |
+| serial_number | VARCHAR(50) UNIQUE | ZKTeco SN |
+| name | VARCHAR(100) | e.g. "K40 Pro — HR" |
+| department | VARCHAR(100) | e.g. "Engineering" |
+| location | VARCHAR(255) | e.g. "Floor 3 East" |
+| is_active | TINYINT(1) | 0 = disabled |
+| last_seen_at | DATETIME | updated on each ADMS hit |
+| created_at | DATETIME | |
+
+### `attendance_logs`
+| Column | Type | Notes |
+|---|---|---|
+| id | BIGINT UNSIGNED PK | |
+| device_id | INT UNSIGNED FK | → devices.id |
+| device_sn | VARCHAR(50) | denormalised for fast query |
+| user_id | VARCHAR(50) | employee ID from device |
+| punch_time | DATETIME | |
+| status | TINYINT | 0=check-in, 1=check-out, 4=OT-in, 5=OT-out |
+| verify_type | TINYINT | 1=fingerprint, 3=password, etc. |
+| work_code | VARCHAR(20) | |
+| raw_line | TEXT | original ATTLOG line |
+| created_at | DATETIME | |
+
+### `api_keys`
+| Column | Type | Notes |
+|---|---|---|
+| id | INT UNSIGNED PK | |
+| name | VARCHAR(100) | human label |
+| project_name | VARCHAR(100) | consuming project |
+| api_key_hash | CHAR(64) UNIQUE | SHA-256 of raw key |
+| permissions | JSON | `{"attendance":"read","devices":"read"}` |
+| is_active | TINYINT(1) | |
+| last_used_at | DATETIME | |
+| created_at | DATETIME | |
+
+---
+
+## ADMS Endpoints (device → server, no auth)
+
+```
+GET  /adms?action=getrequest&SN={serial}   → "OK"  (heartbeat)
+POST /adms?action=devicecmd&SN={serial}    → parse ATTLOG, store records
+```
+
+- SN not in `devices` table → **403 Rejected**
+- `is_active = 0` → **403 Disabled**
+- `last_seen_at` updated on every hit
+
+---
+
+## REST API Endpoints (require `X-API-Key` header)
+
+### Attendance
+- `GET /api/attendance` — filter: device_sn, department, user_id, status, date_from, date_to, page, limit
+- `GET /api/attendance/{id}`
+
+### Devices
+- `GET /api/devices`
+- `POST /api/devices` — register new device (requires devices:write)
+- `GET /api/devices/{sn}`
+- `PATCH /api/devices/{sn}` — update name/department/location/is_active
+
+### API Keys (requires keys:admin permission)
+- `GET /api/keys`
+- `POST /api/keys` — create key, returns raw key once
+- `DELETE /api/keys/{id}` — revoke key
+
+### No Auth
+- `GET /api/ping` — health check
+
+---
+
+## Environment Variables (.env)
+
+```
+DB_HOST=mysql
+DB_PORT=3306
+DB_DATABASE=zk_attendance
+DB_USERNAME=zk_user
+DB_PASSWORD=<strong password>
+MYSQL_ROOT_PASSWORD=<root password>
+APP_PORT=8012
+API_ADMIN_KEY=<hex 40 bytes — openssl rand -hex 40>
+CORS_ALLOWED_ORIGINS=*
+```
+
+---
+
+## Coding Rules
+
+### PHP
+- PHP 8.2, no framework, no Composer — plain autoloader via `spl_autoload_register` in `bootstrap.php`
+- Use PDO for all DB queries with prepared statements
+- All controllers use `Api\Response::*()` methods for consistent JSON output
+- Never echo directly in controllers — always use `Response`
+- `log_request()` helper (from bootstrap) for every ADMS hit and error
+- Namespace convention: `Adms\*`, `Api\*`, root-level for `Database`, `Router`
+
+### Security
+- ADMS endpoints: validate SN against `devices` table; reject unknown/inactive devices
+- REST API: `ApiKeyAuth::authenticate($resource, $level)` — call at the top of every controller method
+- API keys stored as SHA-256 hash only; raw key shown once at creation
+- `API_ADMIN_KEY` env variable = bootstrap key with full admin access (no DB entry)
+- Sanitize all ATTLOG fields before insert (userId: alphanumeric only, punchTime: regex validated)
+
+### Dashboard
+- Plain PHP + HTML/CSS, no JS frameworks
+- Dark theme, responsive sidebar with device list + online/offline status
+- Filter by date, department, device, user ID, status
+- Paginate at 50 per page
+
+---
+
+## Background
+The ZKTeco K40 Pro was previously connected to ZKTeco's BioTime/ZKTime software. The license expired. This middleware completely replaces that software using the open ADMS HTTP protocol built into the device.
+
+## References
+Company server setup → `C:\Users\ShayoJoe\Desktop\cclser-platform-main`
