@@ -48,6 +48,16 @@ class AdmsHandler
             return;
         }
 
+        $allowedIp = $device['allowed_ip'] ?? null;
+        if ($allowedIp !== null && $allowedIp !== '') {
+            $clientIp = $this->resolveClientIp();
+            if ($clientIp !== $allowedIp) {
+                log_request("ADMS REJECTED — IP mismatch SN={$sn} expected={$allowedIp} got={$clientIp}");
+                $this->refuse(403, 'Source IP not allowed');
+                return;
+            }
+        }
+
         match ($action) {
             'getrequest' => $this->handleGetRequest($device),
             'devicecmd'  => $this->handleDeviceCmd($device),
@@ -201,6 +211,37 @@ class AdmsHandler
         }
 
         return null;
+    }
+
+    /**
+     * Return the real client IP.
+     * Prefers X-Forwarded-For (first hop) when the immediate peer is a
+     * private/loopback address (i.e. a local reverse-proxy or Docker ingress).
+     * Falls back to REMOTE_ADDR otherwise.
+     */
+    private function resolveClientIp(): string
+    {
+        $remoteAddr = $_SERVER['REMOTE_ADDR'] ?? '';
+
+        $xff = $_SERVER['HTTP_X_FORWARDED_FOR'] ?? '';
+        if ($xff !== '' && $this->isPrivateOrLoopback($remoteAddr)) {
+            // Take only the first (leftmost) entry — that is the original client.
+            $first = trim(explode(',', $xff)[0]);
+            if (filter_var($first, FILTER_VALIDATE_IP)) {
+                return $first;
+            }
+        }
+
+        return $remoteAddr;
+    }
+
+    private function isPrivateOrLoopback(string $ip): bool
+    {
+        return filter_var(
+            $ip,
+            FILTER_VALIDATE_IP,
+            FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE
+        ) === false;
     }
 
     private function refuse(int $code, string $message): void

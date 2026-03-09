@@ -146,7 +146,7 @@ class DeviceController
         $updates = [];
         $bind    = [':id' => $device['id']];
 
-        $allowed = ['name', 'department', 'location', 'is_active'];
+        $allowed = ['name', 'department', 'location', 'is_active', 'allowed_ip'];
         foreach ($allowed as $field) {
             if (!array_key_exists($field, $body)) {
                 continue;
@@ -154,6 +154,11 @@ class DeviceController
             $value = $body[$field];
             if ($field === 'is_active') {
                 $value = (int) (bool) $value;
+            } elseif ($field === 'allowed_ip') {
+                $value = $value === null || trim((string) $value) === '' ? null : trim((string) $value);
+                if ($value !== null && !filter_var($value, FILTER_VALIDATE_IP)) {
+                    Response::error("allowed_ip must be a valid IP address or null to remove the restriction", 422);
+                }
             } else {
                 $value = substr(trim((string) $value), 0, ($field === 'location' ? 255 : 100));
             }
@@ -162,7 +167,7 @@ class DeviceController
         }
 
         if ($updates === []) {
-            Response::error('No updatable fields provided. Allowed: name, department, location, is_active', 422);
+            Response::error('No updatable fields provided. Allowed: name, department, location, is_active, allowed_ip', 422);
         }
 
         $pdo = \Database::connection();
